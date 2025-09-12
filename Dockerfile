@@ -1,20 +1,42 @@
+# ----------------------
+# Build stage
+# ----------------------
 FROM golang:1.23.6 AS builder
 
 WORKDIR /app
+
+# Copy source code
 COPY . .
-RUN go mod init loadtester || true
+
+# Initialize Go module only if missing
+RUN [ -f go.mod ] || go mod init loadtester
 RUN go mod tidy
+
+# Build Go binary
 RUN go build -o loadtester main.go
 
-# Use bookworm-slim instead of bullseye-slim
+# ----------------------
+# Runtime stage
+# ----------------------
 FROM debian:bookworm-slim
+
 WORKDIR /app
+
+# Copy binary
 COPY --from=builder /app/loadtester /app/loadtester
 
-ENV URL="https://1.1.1.1"
-ENV REQUESTS=100
-ENV INTERVAL=10
-ENV REPEAT_DELAY=5
-ENV REPEAT_COUNT=3
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+# Create reports directory
+RUN mkdir -p /app/reports
+
+# Default environment variables
+ENV URL="https://google.com" \
+    REQUESTS=100 \
+    INTERVAL=3 \
+    REPEAT_DELAY=5 \
+    REPEAT_COUNT=3 \
+    REPORT_DIR="/app/reports"
+
+# Run binary
 ENTRYPOINT ["/app/loadtester"]

@@ -59,7 +59,6 @@ func loadConfig() Config {
 	}
 }
 
-// Optimized HTTP client with connection pooling
 func createHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 15 * time.Second,
@@ -102,7 +101,6 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 	if !cfg.Burst && cfg.Requests > 1000 {
 		numGoroutines = 1000
 	}
-
 	sem := make(chan struct{}, numGoroutines)
 
 	var ticker *time.Ticker
@@ -118,7 +116,6 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 		<-sem
 	}
 
-	// Dispatch requests
 	for i := 1; i <= cfg.Requests; i++ {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -128,7 +125,6 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 		}
 	}
 
-	// Close results channel after all workers done
 	go func() {
 		wg.Wait()
 		close(results)
@@ -154,11 +150,9 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 		})
 	}
 
-	// Write CSV batch
 	writer.WriteAll(batch)
 	atomic.AddInt64(totalFailed, int64(fail))
 
-	// Compute latency percentiles
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	p50, p90, p99 := int64(0), int64(0), int64(0)
 	if len(latencies) > 0 {
@@ -177,8 +171,15 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 
 func main() {
 	cfg := loadConfig()
+
+	// Ensure reports dir exists
+	reportDir := getEnv("REPORT_DIR", "/app/reports")
+	if err := os.MkdirAll(reportDir, 0755); err != nil {
+		log.Fatalf("Failed to create reports directory: %v", err)
+	}
+
 	timestamp := time.Now().Format("20060102_150405")
-	fileName := fmt.Sprintf("results_%s.csv", timestamp)
+	fileName := fmt.Sprintf("%s/results_%s.csv", reportDir, timestamp)
 
 	var file *os.File
 	var writer *csv.Writer
