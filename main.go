@@ -26,6 +26,7 @@ type Config struct {
 	Burst       bool
 	Compress    bool
 	LogRequests bool
+	MaxRetries  int
 }
 
 type Result struct {
@@ -52,6 +53,7 @@ func loadConfig() Config {
 	burst := getEnv("BURST", "false") == "true"
 	compress := getEnv("COMPRESS", "false") == "true"
 	logReq := getEnv("LOG_REQUESTS", "true") == "true"
+	maxRetries, _ := strconv.Atoi(getEnv("MAX_RETRIES", "1"))
 
 	return Config{
 		URL:         url,
@@ -63,6 +65,7 @@ func loadConfig() Config {
 		Burst:       burst,
 		Compress:    compress,
 		LogRequests: logReq,
+		MaxRetries:  maxRetries,
 	}
 }
 
@@ -70,126 +73,131 @@ func createHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        100_000,
-			MaxIdleConnsPerHost: 100_000,
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 1000,
 			DisableKeepAlives:   false,
 		},
 	}
 }
 
-func worker(client *http.Client, url string, id int, results chan<- Result, logReq bool) {
-	start := time.Now()
+func worker(id int, cfg Config, client *http.Client, jobs <-chan int, results chan<- Result, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for reqID := range jobs {
+		var r Result
+		start := time.Now()
+		for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+			req, err := http.NewRequest("GET", cfg.URL, nil)
+			if err != nil {
+				r = Result{RequestID: reqID, Status: 0, Error: err.Error(), Duration: time.Since(start)}
+				continue
+			}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		results <- Result{RequestID: id, Status: 0, Error: err.Error()}
-		return
+			if cfg.LogRequests {
+				dump, _ := httputil.DumpRequestOut(req, true)
+				log.Printf("[Request %d]\n%s\n", reqID, string(dump))
+			}
+
+			resp, err := client.Do(req)
+			duration := time.Since(start)
+			if err != nil {
+				r = Result{RequestID: reqID, Status: 0, Error: err.Error(), Duration: duration}
+				continue
+			}
+			defer resp.Body.Close()
+
+			if cfg.LogRequests {
+				dump, _ := httputil.DumpResponse(resp, true)
+				log.Printf("[Response %d]\n%s\n", reqID, string(dump))
+			}
+
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+			status := resp.StatusCode
+			errStr := ""
+			if status >= 400 {
+				errStr = fmt.Sprintf("HTTP %d: %s", status, string(body))
+			}
+
+			r = Result{RequestID: reqID, Status: status, Error: errStr, Duration: duration}
+
+			// Retry only if failed
+			if r.Error == "" {
+				break
+			}
+		}
+
+		results <- r
+
+		// Spread requests if not burst mode
+		if !cfg.Burst && cfg.Interval > 0 {
+			time.Sleep(time.Duration(float64(cfg.Interval)/float64(cfg.Requests)*1000) * time.Millisecond)
+		}
 	}
-
-	if logReq {
-		dump, _ := httputil.DumpRequestOut(req, true)
-		log.Printf("[Request %d]\n%s\n", id, string(dump))
-	}
-
-	resp, err := client.Do(req)
-	duration := time.Since(start)
-	if err != nil {
-		results <- Result{RequestID: id, Status: 0, Error: err.Error(), Duration: duration}
-		return
-	}
-	defer resp.Body.Close()
-
-	if logReq {
-		dump, _ := httputil.DumpResponse(resp, true)
-		log.Printf("[Response %d]\n%s\n", id, string(dump))
-	}
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-	status := resp.StatusCode
-	errStr := ""
-	if status >= 400 {
-		errStr = fmt.Sprintf("HTTP %d: %s", status, string(body))
-	}
-
-	results <- Result{RequestID: id, Status: status, Error: errStr, Duration: duration}
 }
 
-func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.Duration {
+func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed, totalSucceeded *int64, allLatencies *[]int64, mu *sync.Mutex) time.Duration {
 	fmt.Printf("Starting test run #%d\n", run)
 	client := createHTTPClient()
+	jobs := make(chan int, cfg.Requests)
 	results := make(chan Result, cfg.Requests)
+
 	var wg sync.WaitGroup
-
-	startRun := time.Now()
-
-	// Concurrency limiter
-	sem := make(chan struct{}, cfg.Concurrency)
-
-	// Interval ticker (to spread requests evenly if not burst)
-	var ticker *time.Ticker
-	if !cfg.Burst {
-		intervalPerReq := time.Duration(float64(cfg.Interval) / float64(cfg.Requests) * float64(time.Second))
-		ticker = time.NewTicker(intervalPerReq)
-		defer ticker.Stop()
-	}
-
-	send := func(id int) {
-		defer wg.Done()
-		worker(client, cfg.URL, id, results, cfg.LogRequests)
-		<-sem
-	}
-
-	for i := 1; i <= cfg.Requests; i++ {
+	for w := 0; w < cfg.Concurrency; w++ {
 		wg.Add(1)
-		sem <- struct{}{}
-		go send(i)
-		if !cfg.Burst {
-			<-ticker.C
-		}
+		go worker(w, cfg, client, jobs, results, &wg)
 	}
 
 	go func() {
-		wg.Wait()
-		close(results)
+		for i := 1; i <= cfg.Requests; i++ {
+			jobs <- i
+		}
+		close(jobs)
 	}()
 
-	// Collect results
-	batch := make([][]string, 0, cfg.Requests)
-	var success, fail int32
-	var latencies []int64
-	for r := range results {
-		if r.Error != "" {
-			fail++
-		} else {
-			success++
+	var collectorWg sync.WaitGroup
+	collectorWg.Add(1)
+	startRun := time.Now()
+	go func() {
+		defer collectorWg.Done()
+		for r := range results {
+			writer.Write([]string{
+				strconv.Itoa(run),
+				strconv.Itoa(r.RequestID),
+				strconv.Itoa(r.Status),
+				r.Error,
+				fmt.Sprintf("%d", r.Duration.Milliseconds()),
+			})
+			writer.Flush()
+
+			if r.Error != "" {
+				atomic.AddInt64(totalFailed, 1)
+			} else {
+				atomic.AddInt64(totalSucceeded, 1)
+			}
+
+			mu.Lock()
+			*allLatencies = append(*allLatencies, r.Duration.Milliseconds())
+			mu.Unlock()
 		}
-		latencies = append(latencies, r.Duration.Milliseconds())
-		batch = append(batch, []string{
-			strconv.Itoa(run),
-			strconv.Itoa(r.RequestID),
-			strconv.Itoa(r.Status),
-			r.Error,
-			fmt.Sprintf("%d", r.Duration.Milliseconds()),
-		})
+	}()
+
+	wg.Wait()
+	close(results)
+	collectorWg.Wait()
+
+	// Calculate per-run latency
+	sorted := make([]int64, len(*allLatencies))
+	copy(sorted, *allLatencies)
+	if len(sorted) > 0 {
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		p50 := sorted[len(sorted)/2]
+		p90 := sorted[int(float64(len(sorted))*0.9)]
+		p99 := sorted[int(float64(len(sorted))*0.99)]
+		fmt.Printf("Run %d completed: Requests=%d, Success=%d, Failed=%d, Time=%.2fs\n",
+			run, cfg.Requests, *totalSucceeded, *totalFailed, time.Since(startRun).Seconds())
+		fmt.Printf("Latency(ms): p50=%d, p90=%d, p99=%d\n", p50, p90, p99)
 	}
 
-	writer.WriteAll(batch)
-	atomic.AddInt64(totalFailed, int64(fail))
-
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	p50, p90, p99 := int64(0), int64(0), int64(0)
-	if len(latencies) > 0 {
-		p50 = latencies[len(latencies)/2]
-		p90 = latencies[int(float64(len(latencies))*0.9)]
-		p99 = latencies[int(float64(len(latencies))*0.99)]
-	}
-
-	durationRun := time.Since(startRun)
-	fmt.Printf("Run %d completed: Requests=%d, Success=%d, Failed=%d, Time=%.2fs\n",
-		run, cfg.Requests, success, fail, durationRun.Seconds())
-	fmt.Printf("Latency(ms): p50=%d, p90=%d, p99=%d\n", p50, p90, p99)
-
-	return durationRun
+	return time.Since(startRun)
 }
 
 func main() {
@@ -198,13 +206,9 @@ func main() {
 	reportDir := getEnv("REPORT_DIR", "reports")
 	logDir := getEnv("LOG_DIR", "logs")
 
-	if err := os.MkdirAll(reportDir, 0755); err != nil {
-		log.Fatalf("Failed to create reports directory: %v", err)
-	}
+	os.MkdirAll(reportDir, 0755)
 	if cfg.LogRequests {
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			log.Fatalf("Failed to create logs directory: %v", err)
-		}
+		os.MkdirAll(logDir, 0755)
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
@@ -246,9 +250,13 @@ func main() {
 	}
 
 	var totalFailed int64
+	var totalSucceeded int64
+	var allLatencies []int64
+	var mu sync.Mutex
 	var totalDuration time.Duration
+
 	for run := 1; run <= cfg.RepeatCount; run++ {
-		duration := runLoad(cfg, run, writer, &totalFailed)
+		duration := runLoad(cfg, run, writer, &totalFailed, &totalSucceeded, &allLatencies, &mu)
 		totalDuration += duration
 		if run < cfg.RepeatCount {
 			fmt.Printf("Waiting %d seconds before next run...\n", cfg.RepeatDelay)
@@ -256,11 +264,26 @@ func main() {
 		}
 	}
 
-	fmt.Printf("All test runs completed. Total failed requests: %d\n", totalFailed)
-	fmt.Printf("Total wall-clock time for all runs: %.2fs\n", totalDuration.Seconds())
-	fmt.Printf("Report saved to file: %s\n", fileName)
+	totalRequests := int64(cfg.Requests) * int64(cfg.RepeatCount)
+	sort.Slice(allLatencies, func(i, j int) bool { return allLatencies[i] < allLatencies[j] })
+	p50, p90, p99 := int64(0), int64(0), int64(0)
+	if len(allLatencies) > 0 {
+		p50 = allLatencies[len(allLatencies)/2]
+		p90 = allLatencies[int(float64(len(allLatencies))*0.9)]
+		p99 = allLatencies[int(float64(len(allLatencies))*0.99)]
+	}
+
+	fmt.Println("--------------------------------------------------")
+	fmt.Println("FINAL SUMMARY")
+	fmt.Println("--------------------------------------------------")
+	fmt.Printf("Total requests : %d\n", totalRequests)
+	fmt.Printf("Succeeded      : %d\n", totalSucceeded)
+	fmt.Printf("Failed         : %d\n", totalFailed)
+	fmt.Printf("Overall Latency(ms): p50=%d, p90=%d, p99=%d\n", p50, p90, p99)
+	fmt.Printf("Total wall-clock time: %.2fs\n", totalDuration.Seconds())
+	fmt.Println("Report saved to file:", fileName)
 	if cfg.Compress {
-		fmt.Printf("Compressed report: %s.gz\n", fileName)
+		fmt.Println("Compressed report:", fileName+".gz")
 	}
 	if cfg.LogRequests {
 		fmt.Printf("Detailed logs saved to logs/results_%s.log\n", timestamp)
