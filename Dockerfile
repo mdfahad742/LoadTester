@@ -8,11 +8,11 @@ WORKDIR /app
 # Copy source code
 COPY . .
 
-# Initialize Go module only if missing
+# Init module if missing and tidy
 RUN [ -f go.mod ] || go mod init loadtester
 RUN go mod tidy
 
-# Build Go binary
+# Build binary
 RUN go build -o loadtester main.go
 
 # ----------------------
@@ -25,18 +25,25 @@ WORKDIR /app
 # Copy binary
 COPY --from=builder /app/loadtester /app/loadtester
 
+# Install certificates
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Create reports directory
-RUN mkdir -p /app/reports
+# Create directories with proper permissions
+RUN mkdir -p /app/reports /app/logs
+RUN chmod 777 /app/reports /app/logs
 
 # Default environment variables
-ENV URL="https://google.com" \
+ENV URL="https://1.1.1.1" \
     REQUESTS=100 \
-    INTERVAL=3 \
+    CONCURRENCY=10 \
+    INTERVAL=5 \
     REPEAT_DELAY=5 \
     REPEAT_COUNT=3 \
-    REPORT_DIR="/app/reports"
+    BURST=false \
+    COMPRESS=false \
+    LOG_REQUESTS=true \
+    REPORT_DIR="/app/reports" \
+    LOG_DIR="/app/logs"
 
-# Run binary
+# Entry point
 ENTRYPOINT ["/app/loadtester"]

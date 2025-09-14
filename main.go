@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"sort"
 	"strconv"
@@ -21,8 +22,10 @@ type Config struct {
 	Interval    int // seconds
 	RepeatDelay int
 	RepeatCount int
+	Concurrency int
 	Burst       bool
 	Compress    bool
+	LogRequests bool
 }
 
 type Result struct {
@@ -45,8 +48,10 @@ func loadConfig() Config {
 	interval, _ := strconv.Atoi(getEnv("INTERVAL", "10"))
 	repeatDelay, _ := strconv.Atoi(getEnv("REPEAT_DELAY", "5"))
 	repeatCount, _ := strconv.Atoi(getEnv("REPEAT_COUNT", "1"))
+	concurrency, _ := strconv.Atoi(getEnv("CONCURRENCY", "100"))
 	burst := getEnv("BURST", "false") == "true"
 	compress := getEnv("COMPRESS", "false") == "true"
+	logReq := getEnv("LOG_REQUESTS", "true") == "true"
 
 	return Config{
 		URL:         url,
@@ -54,8 +59,10 @@ func loadConfig() Config {
 		Interval:    interval,
 		RepeatDelay: repeatDelay,
 		RepeatCount: repeatCount,
+		Concurrency: concurrency,
 		Burst:       burst,
 		Compress:    compress,
+		LogRequests: logReq,
 	}
 }
 
@@ -70,21 +77,40 @@ func createHTTPClient() *http.Client {
 	}
 }
 
-func worker(client *http.Client, url string, id int, results chan<- Result) {
+func worker(client *http.Client, url string, id int, results chan<- Result, logReq bool) {
 	start := time.Now()
-	resp, err := client.Get(url)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		results <- Result{RequestID: id, Status: 0, Error: err.Error()}
+		return
+	}
+
+	if logReq {
+		dump, _ := httputil.DumpRequestOut(req, true)
+		log.Printf("[Request %d]\n%s\n", id, string(dump))
+	}
+
+	resp, err := client.Do(req)
 	duration := time.Since(start)
 	if err != nil {
 		results <- Result{RequestID: id, Status: 0, Error: err.Error(), Duration: duration}
 		return
 	}
+	defer resp.Body.Close()
+
+	if logReq {
+		dump, _ := httputil.DumpResponse(resp, true)
+		log.Printf("[Response %d]\n%s\n", id, string(dump))
+	}
+
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-	resp.Body.Close()
 	status := resp.StatusCode
 	errStr := ""
 	if status >= 400 {
 		errStr = fmt.Sprintf("HTTP %d: %s", status, string(body))
 	}
+
 	results <- Result{RequestID: id, Status: status, Error: errStr, Duration: duration}
 }
 
@@ -96,23 +122,20 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 
 	startRun := time.Now()
 
-	// Determine number of concurrent workers
-	numGoroutines := cfg.Requests
-	if !cfg.Burst && cfg.Requests > 1000 {
-		numGoroutines = 1000
-	}
-	sem := make(chan struct{}, numGoroutines)
+	// Concurrency limiter
+	sem := make(chan struct{}, cfg.Concurrency)
 
+	// Interval ticker (to spread requests evenly if not burst)
 	var ticker *time.Ticker
 	if !cfg.Burst {
-		intervalPerReq := time.Duration(float64(cfg.Interval)/float64(cfg.Requests)*1e9) * time.Nanosecond
+		intervalPerReq := time.Duration(float64(cfg.Interval) / float64(cfg.Requests) * float64(time.Second))
 		ticker = time.NewTicker(intervalPerReq)
 		defer ticker.Stop()
 	}
 
 	send := func(id int) {
 		defer wg.Done()
-		worker(client, cfg.URL, id, results)
+		worker(client, cfg.URL, id, results, cfg.LogRequests)
 		<-sem
 	}
 
@@ -172,10 +195,16 @@ func runLoad(cfg Config, run int, writer *csv.Writer, totalFailed *int64) time.D
 func main() {
 	cfg := loadConfig()
 
-	// Ensure reports dir exists
-	reportDir := getEnv("REPORT_DIR", "/app/reports")
+	reportDir := getEnv("REPORT_DIR", "reports")
+	logDir := getEnv("LOG_DIR", "logs")
+
 	if err := os.MkdirAll(reportDir, 0755); err != nil {
 		log.Fatalf("Failed to create reports directory: %v", err)
+	}
+	if cfg.LogRequests {
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Fatalf("Failed to create logs directory: %v", err)
+		}
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
@@ -207,6 +236,15 @@ func main() {
 
 	writer.Write([]string{"RunID", "RequestID", "Status", "Error", "Duration(ms)"})
 
+	if cfg.LogRequests {
+		logFile, err := os.Create(fmt.Sprintf("%s/results_%s.log", logDir, timestamp))
+		if err != nil {
+			log.Fatalf("Failed to create log file: %v", err)
+		}
+		defer logFile.Close()
+		log.SetOutput(logFile)
+	}
+
 	var totalFailed int64
 	var totalDuration time.Duration
 	for run := 1; run <= cfg.RepeatCount; run++ {
@@ -223,5 +261,8 @@ func main() {
 	fmt.Printf("Report saved to file: %s\n", fileName)
 	if cfg.Compress {
 		fmt.Printf("Compressed report: %s.gz\n", fileName)
+	}
+	if cfg.LogRequests {
+		fmt.Printf("Detailed logs saved to logs/results_%s.log\n", timestamp)
 	}
 }
