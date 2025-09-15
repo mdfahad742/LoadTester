@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -75,9 +76,17 @@ func loadConfig() Config {
 
 // createHTTPClient returns a high-performance HTTP client
 func createHTTPClient() *http.Client {
+	// Read VERIFY_TLS env var (default true)
+	verifyTLS, _ := strconv.ParseBool(getEnv("VERIFY_TLS", "true"))
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: !verifyTLS, // skip verification if VERIFY_TLS=false
+	}
+
 	return &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
+			TLSClientConfig:     tlsConfig,
 			MaxIdleConns:        50_000,
 			MaxIdleConnsPerHost: 50_000,
 			DisableKeepAlives:   false,
@@ -93,6 +102,7 @@ func worker(client *http.Client, url string, id int, results chan<- Result, logR
 	var attempt int
 	for attempt = 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; LoadTester/1.0; +https://example.com)")
 		if err != nil {
 			r.Error = err.Error()
 			break
